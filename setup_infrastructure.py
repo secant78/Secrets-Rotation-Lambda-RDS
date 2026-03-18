@@ -165,7 +165,7 @@ def create_db_subnet_group(subnet_ids):
         )
         print(f"  Created DB subnet group: {config.DB_SUBNET_GROUP_NAME}")
     except ClientError as e:
-        if e.response["Error"]["Code"] == "DBSubnetGroupAlreadyExistsFault":
+        if e.response["Error"]["Code"] in ("DBSubnetGroupAlreadyExists", "DBSubnetGroupAlreadyExistsFault"):
             print(f"  DB subnet group already exists: {config.DB_SUBNET_GROUP_NAME}")
         else:
             raise
