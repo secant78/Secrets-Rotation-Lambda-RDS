@@ -127,23 +127,40 @@ def create_security_groups():
         )
         rds_sg_id = resp["GroupId"]
         print(f"  Created RDS SG: {rds_sg_id}")
-        # Add inbound rule: TCP 3306 from Lambda SG
+        # Add inbound rule: TCP 3306 from anywhere (Lambda runs outside VPC)
         ec2.authorize_security_group_ingress(
             GroupId=rds_sg_id,
             IpPermissions=[{
                 "IpProtocol": "tcp",
                 "FromPort":   config.DB_PORT,
                 "ToPort":     config.DB_PORT,
-                "UserIdGroupPairs": [{"GroupId": lambda_sg_id}],
+                "IpRanges":   [{"CidrIp": "0.0.0.0/0", "Description": "MySQL from Lambda (no VPC)"}],
             }],
         )
-        print(f"  Authorized MySQL (3306) from Lambda SG on RDS SG")
+        print(f"  Authorized MySQL (3306) from 0.0.0.0/0 on RDS SG")
     except ClientError as e:
         if e.response["Error"]["Code"] == "InvalidGroup.Duplicate":
             filters = [{"Name": "group-name", "Values": [config.RDS_SG_NAME]},
                        {"Name": "vpc-id",      "Values": [vpc_id]}]
             rds_sg_id = ec2.describe_security_groups(Filters=filters)["SecurityGroups"][0]["GroupId"]
             print(f"  RDS SG already exists: {rds_sg_id}")
+            # Ensure 0.0.0.0/0 rule exists (idempotent)
+            try:
+                ec2.authorize_security_group_ingress(
+                    GroupId=rds_sg_id,
+                    IpPermissions=[{
+                        "IpProtocol": "tcp",
+                        "FromPort":   config.DB_PORT,
+                        "ToPort":     config.DB_PORT,
+                        "IpRanges":   [{"CidrIp": "0.0.0.0/0", "Description": "MySQL from Lambda (no VPC)"}],
+                    }],
+                )
+                print(f"  Added 0.0.0.0/0 MySQL rule to existing RDS SG")
+            except ClientError as ie:
+                if ie.response["Error"]["Code"] == "InvalidPermission.Duplicate":
+                    print(f"  0.0.0.0/0 MySQL rule already exists on RDS SG")
+                else:
+                    raise
         else:
             raise
 
@@ -183,10 +200,21 @@ def create_rds_instance(rds_sg_id):
         resp = rds.describe_db_instances(DBInstanceIdentifier=config.DB_INSTANCE_ID)
         status = resp["DBInstances"][0]["DBInstanceStatus"]
         endpoint = resp["DBInstances"][0].get("Endpoint", {}).get("Address")
+        publicly = resp["DBInstances"][0].get("PubliclyAccessible", False)
         if status == "available" and endpoint:
-            print(f"  RDS instance already available: {endpoint}")
-            return endpoint
-        print(f"  RDS instance exists (status={status}), waiting for available...")
+            if not publicly:
+                print(f"  RDS instance exists but is not publicly accessible — modifying...")
+                rds.modify_db_instance(
+                    DBInstanceIdentifier=config.DB_INSTANCE_ID,
+                    PubliclyAccessible=True,
+                    ApplyImmediately=True,
+                )
+                print(f"  Modification submitted. Waiting for available...")
+            else:
+                print(f"  RDS instance already available: {endpoint}")
+                return endpoint
+        else:
+            print(f"  RDS instance exists (status={status}), waiting for available...")
     except ClientError as e:
         if e.response["Error"]["Code"] in ("DBInstanceNotFound", "DBInstanceNotFoundFault"):
             rds.create_db_instance(
@@ -199,7 +227,7 @@ def create_rds_instance(rds_sg_id):
                 DBName=config.DB_NAME,
                 DBSubnetGroupName=config.DB_SUBNET_GROUP_NAME,
                 VpcSecurityGroupIds=[rds_sg_id],
-                PubliclyAccessible=False,
+                PubliclyAccessible=True,
                 MultiAZ=False,
                 StorageType="gp2",
                 AllocatedStorage=20,
@@ -432,8 +460,6 @@ def create_rotation_lambda(role_arn, subnet_ids, lambda_sg_id):
     print("  Packaging rotation_handler.py + pymysql...")
     code = _zip_lambda_with_pymysql("rotation_handler.py")
 
-    vpc_config = {"SubnetIds": subnet_ids, "SecurityGroupIds": [lambda_sg_id]}
-
     for attempt in range(1, 13):
         try:
             resp   = lambda_.create_function(
@@ -444,7 +470,6 @@ def create_rotation_lambda(role_arn, subnet_ids, lambda_sg_id):
                 Code={"ZipFile": code},
                 Timeout=config.LAMBDA_TIMEOUT,
                 MemorySize=config.LAMBDA_MEMORY,
-                VpcConfig=vpc_config,
                 Description="Secrets Manager rotation handler for RDS MySQL",
             )
             fn_arn = resp["FunctionArn"]
@@ -469,7 +494,6 @@ def create_rotation_lambda(role_arn, subnet_ids, lambda_sg_id):
                     Role=role_arn,
                     Timeout=config.LAMBDA_TIMEOUT,
                     MemorySize=config.LAMBDA_MEMORY,
-                    VpcConfig=vpc_config,
                 )
                 fn_arn = lambda_.get_function_configuration(
                     FunctionName=config.ROTATION_LAMBDA_NAME
@@ -491,8 +515,7 @@ def create_app_lambda(role_arn, subnet_ids, lambda_sg_id):
     print("  Packaging app_handler.py + pymysql...")
     code = _zip_lambda_with_pymysql("app_handler.py")
 
-    vpc_config = {"SubnetIds": subnet_ids, "SecurityGroupIds": [lambda_sg_id]}
-    env_vars   = {"Variables": {"SECRET_NAME": config.SECRET_NAME}}
+    env_vars = {"Variables": {"SECRET_NAME": config.SECRET_NAME}}
 
     for attempt in range(1, 13):
         try:
@@ -504,7 +527,6 @@ def create_app_lambda(role_arn, subnet_ids, lambda_sg_id):
                 Code={"ZipFile": code},
                 Timeout=config.LAMBDA_TIMEOUT,
                 MemorySize=config.LAMBDA_MEMORY,
-                VpcConfig=vpc_config,
                 Environment=env_vars,
                 Description="Application Lambda that reads secret and connects to RDS",
             )
@@ -530,7 +552,6 @@ def create_app_lambda(role_arn, subnet_ids, lambda_sg_id):
                     Role=role_arn,
                     Timeout=config.LAMBDA_TIMEOUT,
                     MemorySize=config.LAMBDA_MEMORY,
-                    VpcConfig=vpc_config,
                     Environment=env_vars,
                 )
                 fn_arn = lambda_.get_function_configuration(
