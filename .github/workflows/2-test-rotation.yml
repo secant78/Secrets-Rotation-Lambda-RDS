@@ -1,0 +1,168 @@
+name: 2 - Test Rotation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test:
+    name: Trigger Rotation and Verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install boto3 pymysql
+
+      - name: Pre-rotation app Lambda invocation
+        run: |
+          echo "=== Invoking app Lambda BEFORE rotation ==="
+          STATUS=$(aws lambda invoke \
+            --function-name app-handler-sean \
+            --payload '{}' \
+            --cli-binary-format raw-in-base64-out \
+            /tmp/pre-rotation-result.json \
+            --query 'StatusCode' \
+            --output text)
+          echo "HTTP Status: $STATUS"
+          echo "Response:"
+          cat /tmp/pre-rotation-result.json
+          echo ""
+          [ "$STATUS" = "200" ] || (echo "ERROR: pre-rotation invocation failed" && exit 1)
+          echo "PRE-ROTATION: app Lambda connects successfully"
+
+      - name: Record current secret version
+        id: pre_rotation
+        run: |
+          CURRENT_VERSION=$(aws secretsmanager describe-secret \
+            --secret-id rds-secrets-rotation-sean \
+            --query 'VersionIdsToStages' \
+            --output json | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for vid, stages in data.items():
+              if 'AWSCURRENT' in stages:
+                  print(vid)
+                  break
+          ")
+          echo "current_version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Current secret version: $CURRENT_VERSION"
+
+      - name: Trigger manual rotation
+        run: |
+          echo "=== Triggering rotation ==="
+          START=$(date +%s)
+          echo "start_epoch=$START" >> "$GITHUB_ENV"
+          aws secretsmanager rotate-secret \
+            --secret-id rds-secrets-rotation-sean
+          echo "Rotation triggered at $(date -u)"
+
+      - name: Wait for rotation to complete (max 3 minutes)
+        run: |
+          echo "=== Polling for rotation completion ==="
+          PRE_VERSION="${{ steps.pre_rotation.outputs.current_version }}"
+          ROTATED=false
+          for i in $(seq 1 18); do
+            sleep 10
+            NEW_VERSION=$(aws secretsmanager describe-secret \
+              --secret-id rds-secrets-rotation-sean \
+              --query 'VersionIdsToStages' \
+              --output json | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for vid, stages in data.items():
+              if 'AWSCURRENT' in stages:
+                  print(vid)
+                  break
+          ")
+            echo "  [${i}0s] AWSCURRENT version: $NEW_VERSION"
+            if [ "$NEW_VERSION" != "$PRE_VERSION" ]; then
+              END=$(date +%s)
+              ELAPSED=$((END - start_epoch))
+              echo ""
+              echo "Rotation complete! Elapsed: ${ELAPSED}s"
+              if [ "$ELAPSED" -lt 120 ]; then
+                echo "SUCCESS: rotation completed in under 2 minutes"
+              else
+                echo "WARNING: rotation took ${ELAPSED}s (over 2-minute target)"
+              fi
+              ROTATED=true
+              break
+            fi
+          done
+          if [ "$ROTATED" = "false" ]; then
+            echo "ERROR: rotation did not complete within 3 minutes"
+            exit 1
+          fi
+
+      - name: Post-rotation app Lambda invocation
+        run: |
+          echo "=== Invoking app Lambda AFTER rotation ==="
+          STATUS=$(aws lambda invoke \
+            --function-name app-handler-sean \
+            --payload '{}' \
+            --cli-binary-format raw-in-base64-out \
+            /tmp/post-rotation-result.json \
+            --query 'StatusCode' \
+            --output text)
+          echo "HTTP Status: $STATUS"
+          echo "Response:"
+          cat /tmp/post-rotation-result.json
+          echo ""
+          [ "$STATUS" = "200" ] || (echo "ERROR: post-rotation invocation failed - new credentials not working!" && exit 1)
+          echo "POST-ROTATION: app Lambda connects successfully with new credentials"
+
+      - name: Verify old credentials demoted to AWSPREVIOUS
+        run: |
+          echo "=== Verifying secret version stages ==="
+          aws secretsmanager describe-secret \
+            --secret-id rds-secrets-rotation-sean \
+            --query 'VersionIdsToStages' \
+            --output json | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          print('Version stages:')
+          for vid, stages in data.items():
+              print(f'  {vid[:8]}...  stages={stages}')
+          curr = [vid for vid, s in data.items() if 'AWSCURRENT'  in s]
+          prev = [vid for vid, s in data.items() if 'AWSPREVIOUS' in s]
+          assert curr, 'ERROR: No AWSCURRENT version found'
+          print()
+          print(f'AWSCURRENT  exists: YES')
+          if prev:
+              print(f'AWSPREVIOUS exists: YES -- old password is demoted (no longer active)')
+          else:
+              print(f'AWSPREVIOUS exists: NO  -- (first rotation, no previous version)')
+          "
+
+      - name: Tail rotation Lambda logs
+        run: |
+          echo "=== Rotation Lambda logs (last 30 minutes) ==="
+          aws logs tail /aws/lambda/rotation-handler-sean \
+            --since 30m \
+            --format short \
+            2>/dev/null || echo "(No log events in the last 30 minutes)"
+
+      - name: Tail app Lambda logs
+        run: |
+          echo "=== App Lambda logs (last 30 minutes) ==="
+          aws logs tail /aws/lambda/app-handler-sean \
+            --since 30m \
+            --format short \
+            2>/dev/null || echo "(No log events in the last 30 minutes)"

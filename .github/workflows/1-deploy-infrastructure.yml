@@ -1,0 +1,69 @@
+name: 1 - Deploy Infrastructure
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Secrets Rotation Infrastructure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install boto3 pymysql
+
+      - name: Deploy infrastructure
+        run: python setup_infrastructure.py
+
+      - name: Show RDS status
+        run: |
+          echo "=== RDS Instance ==="
+          aws rds describe-db-instances \
+            --db-instance-identifier secrets-rotation-db-sean \
+            --query 'DBInstances[0].{ID:DBInstanceIdentifier,Status:DBInstanceStatus,Endpoint:Endpoint.Address,Class:DBInstanceClass}' \
+            --output table
+
+      - name: Show secret rotation config
+        run: |
+          echo "=== Secrets Manager Secret ==="
+          aws secretsmanager describe-secret \
+            --secret-id rds-secrets-rotation-sean \
+            --query '{Name:Name,RotationEnabled:RotationEnabled,NextRotation:NextRotationDate}' \
+            --output table
+
+      - name: Show Lambda functions
+        run: |
+          echo "=== Rotation Lambda ==="
+          aws lambda get-function \
+            --function-name rotation-handler-sean \
+            --query 'Configuration.{Name:FunctionName,State:State,Runtime:Runtime,Timeout:Timeout}' \
+            --output table
+
+          echo "=== App Lambda ==="
+          aws lambda get-function \
+            --function-name app-handler-sean \
+            --query 'Configuration.{Name:FunctionName,State:State,Runtime:Runtime,Timeout:Timeout}' \
+            --output table

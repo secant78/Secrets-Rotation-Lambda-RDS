@@ -1,0 +1,72 @@
+name: 3 - Teardown
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'yes' to confirm teardown of all resources"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  teardown:
+    name: Destroy All Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'yes'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Run teardown
+        run: python teardown.py
+
+      - name: Verify cleanup
+        run: |
+          echo "=== Checking for remaining resources ==="
+
+          RDS=$(aws rds describe-db-instances \
+            --db-instance-identifier secrets-rotation-db-sean \
+            --query 'length(DBInstances)' \
+            --output text 2>/dev/null || echo "0")
+          echo "RDS instances remaining: $RDS"
+
+          SECRET=$(aws secretsmanager describe-secret \
+            --secret-id rds-secrets-rotation-sean \
+            --query 'Name' \
+            --output text 2>/dev/null || echo "none")
+          echo "Secret remaining: $SECRET"
+
+          ROTATION_FN=$(aws lambda get-function \
+            --function-name rotation-handler-sean \
+            --query 'Configuration.FunctionName' \
+            --output text 2>/dev/null || echo "none")
+          echo "Rotation Lambda remaining: $ROTATION_FN"
+
+          APP_FN=$(aws lambda get-function \
+            --function-name app-handler-sean \
+            --query 'Configuration.FunctionName' \
+            --output text 2>/dev/null || echo "none")
+          echo "App Lambda remaining: $APP_FN"
+
+          echo "Teardown verification complete."
