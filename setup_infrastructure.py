@@ -60,7 +60,7 @@ def _get_default_vpc_and_subnets():
     vpcs = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
     vpc_id = vpcs["Vpcs"][0]["VpcId"]
     subnets = ec2.describe_subnets(
-        Filters=[{"Name": "defaultForAz", "Values": ["true"]}]
+        Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
     )
     subnet_ids = [s["SubnetId"] for s in subnets["Subnets"]]
     return vpc_id, subnet_ids
