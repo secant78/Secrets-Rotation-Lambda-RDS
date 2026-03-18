@@ -188,7 +188,7 @@ def create_rds_instance(rds_sg_id):
             return endpoint
         print(f"  RDS instance exists (status={status}), waiting for available...")
     except ClientError as e:
-        if e.response["Error"]["Code"] == "DBInstanceNotFoundFault":
+        if e.response["Error"]["Code"] in ("DBInstanceNotFound", "DBInstanceNotFoundFault"):
             rds.create_db_instance(
                 DBInstanceIdentifier=config.DB_INSTANCE_ID,
                 DBInstanceClass=config.DB_INSTANCE_CLASS,
