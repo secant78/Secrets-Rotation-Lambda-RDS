@@ -569,8 +569,25 @@ def grant_secretsmanager_rotation_permission(rotation_fn_arn):
 # Step 10: Configure automatic rotation
 # ---------------------------------------------------------------------------
 
+def _wait_for_lambda_active(function_name, timeout=60):
+    """Poll until Lambda function state is Active (not Pending)."""
+    import time
+    print(f"  Waiting for Lambda '{function_name}' to become Active...", end="", flush=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = lambda_.get_function_configuration(FunctionName=function_name)
+        state = resp.get("State", "")
+        if state == "Active":
+            print(" Active.")
+            return
+        print(".", end="", flush=True)
+        time.sleep(3)
+    raise TimeoutError(f"Lambda '{function_name}' did not become Active within {timeout}s")
+
+
 def configure_rotation(secret_arn, rotation_fn_arn):
     print("\n[10/10] Configuring rotation schedule (7 days)...")
+    _wait_for_lambda_active(config.ROTATION_LAMBDA_NAME)
     sm.rotate_secret(
         SecretId=secret_arn,
         RotationLambdaARN=rotation_fn_arn,
